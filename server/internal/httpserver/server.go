@@ -9,6 +9,8 @@ import (
 	"tavily-proxy/server/internal/services"
 
 	"log/slog"
+
+	"gorm.io/gorm"
 )
 
 type Dependencies struct {
@@ -24,6 +26,7 @@ type Dependencies struct {
 	CacheService     *services.CacheService
 	TavilyProxy      *services.TavilyProxy
 	AuthLimiter      *services.AuthLimiter
+	Database         *gorm.DB
 	Logger           *slog.Logger
 }
 

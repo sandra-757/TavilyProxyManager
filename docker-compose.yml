@@ -2,8 +2,7 @@ version: "3.8"
 
 services:
   tavily-proxy:
-    image: ghcr.io/xuncv/tavilyproxymanager:latest
-    pull_policy: always
+    image: ghcr.io/xuncv/tavilyproxymanager:v1.1.4
     ports:
       # Loopback only by default: put a TLS reverse proxy in front before
       # exposing this publicly; the admin token grants full key export.

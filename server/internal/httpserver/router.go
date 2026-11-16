@@ -2,6 +2,7 @@ package httpserver
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -42,6 +43,21 @@ func NewRouter(deps Dependencies) http.Handler {
 	r.Any("/mcp", gin.WrapH(mcpHandler))
 
 	r.GET("/healthz", func(c *gin.Context) {
+		// Liveness is not readiness: report 503 when the database that
+		// holds the key pool is unreachable.
+		if deps.Database != nil {
+			sqlDB, err := deps.Database.DB()
+			if err != nil {
+				c.JSON(http.StatusServiceUnavailable, gin.H{"ok": false, "error": "db_unavailable"})
+				return
+			}
+			ctx, cancel := context.WithTimeout(c.Request.Context(), 2*time.Second)
+			defer cancel()
+			if err := sqlDB.PingContext(ctx); err != nil {
+				c.JSON(http.StatusServiceUnavailable, gin.H{"ok": false, "error": "db_unreachable"})
+				return
+			}
+		}
 		c.JSON(http.StatusOK, gin.H{"ok": true})
 	})
 
@@ -61,6 +77,7 @@ func NewRouter(deps Dependencies) http.Handler {
 		api.GET("/logs", func(c *gin.Context) { handleListLogs(c, deps.LogService) })
 		api.DELETE("/logs", func(c *gin.Context) { handleClearLogs(c, deps.LogService) })
 		api.GET("/stats", func(c *gin.Context) { handleStats(c, deps.StatsService) })
+		api.GET("/metrics", func(c *gin.Context) { handleMetrics(c, deps) })
 		api.GET("/stats/timeseries", func(c *gin.Context) { handleTimeSeries(c, deps.StatsService) })
 
 		api.GET("/settings/master-key", func(c *gin.Context) {
@@ -725,6 +742,45 @@ func handleTimeSeries(c *gin.Context, stats *services.StatsService) {
 	c.JSON(http.StatusOK, out)
 }
 
+// handleMetrics exposes a small JSON snapshot for operators (admin auth
+// required, like every /api route): pool totals and per-status counts.
+func handleMetrics(c *gin.Context, deps Dependencies) {
+	out := gin.H{}
+	if deps.KeyService != nil {
+		if items, err := deps.KeyService.List(c.Request.Context()); err == nil {
+			var totalQuota, usedQuota, active, invalid int
+			for _, k := range items {
+				totalQuota += k.TotalQuota
+				usedQuota += k.UsedQuota
+				if k.IsActive {
+					active++
+				}
+				if k.IsInvalid {
+					invalid++
+				}
+			}
+			out["keys_total"] = len(items)
+			out["keys_active"] = active
+			out["keys_invalid"] = invalid
+			out["quota_total"] = totalQuota
+			out["quota_used_local"] = usedQuota
+		}
+	}
+	if deps.LogService != nil {
+		if counts, err := deps.LogService.StatusCodeCounts(c.Request.Context()); err == nil {
+			byStatus := gin.H{}
+			var total int64
+			for _, sc := range counts {
+				byStatus[strconv.Itoa(sc.StatusCode)] = sc.Count
+				total += sc.Count
+			}
+			out["requests_logged"] = total
+			out["requests_by_status"] = byStatus
+		}
+	}
+	c.JSON(http.StatusOK, out)
+}
+
 func handleProxy(c *gin.Context, proxy *services.TavilyProxy, body []byte, rawQuery string) {
 	resp, err := proxy.Do(c.Request.Context(), services.ProxyRequest{
 		Method:      c.Request.Method,
@@ -783,15 +839,20 @@ func stripAPIKeyFromJSON(body []byte) (apiKey string, sanitized []byte) {
 		return "", body
 	}
 
+	// Decode with UseNumber so re-serialising the body does not silently
+	// rewrite numbers (float64 would turn e.g. 9007199254740993 into
+	// 9007199254740992 and could mangle large or high-precision values).
 	var m map[string]any
-	if err := json.Unmarshal(trimmed, &m); err != nil {
+	dec := json.NewDecoder(bytes.NewReader(trimmed))
+	dec.UseNumber()
+	if err := dec.Decode(&m); err != nil {
 		return "", body
 	}
 
 	changed := false
 	if v, ok := m["api_key"]; ok {
 		if s, ok := v.(string); ok {
-			apiKey = strings.TrimSpace(s)
+			apiKey = s
 		}
 		delete(m, "api_key")
 		changed = true
@@ -799,7 +860,7 @@ func stripAPIKeyFromJSON(body []byte) (apiKey string, sanitized []byte) {
 	if v, ok := m["apiKey"]; ok {
 		if apiKey == "" {
 			if s, ok := v.(string); ok {
-				apiKey = strings.TrimSpace(s)
+				apiKey = s
 			}
 		}
 		delete(m, "apiKey")
@@ -842,7 +903,7 @@ func handleGetCache(c *gin.Context, settings *services.SettingsService) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "db_error"})
 		return
 	}
-	ttl, err := settings.GetInt(c.Request.Context(), services.SettingCacheTTLSeconds, 43200)
+	ttl, err := settings.GetInt(c.Request.Context(), services.SettingCacheTTLSeconds, 3600)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "db_error"})
 		return

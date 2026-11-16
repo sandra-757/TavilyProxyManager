@@ -21,6 +21,7 @@ type Config struct {
 	EncryptionKeyFile    string // TPM_ENCRYPTION_KEY_FILE; empty = <db dir>/encryption.key
 	MaxRequestBodyBytes  int64  // MAX_REQUEST_BODY_BYTES, default 10 MiB
 	MaxResponseBodyBytes int64  // MAX_RESPONSE_BODY_BYTES, default 50 MiB
+	ProxyMaxAttempts     int    // PROXY_MAX_ATTEMPTS, default 5
 }
 
 func FromEnv() Config {
@@ -41,6 +42,7 @@ func FromEnv() Config {
 	encryptionKeyFile := getenv("TPM_ENCRYPTION_KEY_FILE", "")
 	maxReqBody := getenvInt64("MAX_REQUEST_BODY_BYTES", 10<<20)
 	maxRespBody := getenvInt64("MAX_RESPONSE_BODY_BYTES", 50<<20)
+	proxyMaxAttempts := int(getenvInt64("PROXY_MAX_ATTEMPTS", 5))
 
 	return Config{
 		ListenAddr:           listenAddr,
@@ -55,6 +57,7 @@ func FromEnv() Config {
 		EncryptionKeyFile:    encryptionKeyFile,
 		MaxRequestBodyBytes:  maxReqBody,
 		MaxResponseBodyBytes: maxRespBody,
+		ProxyMaxAttempts:     proxyMaxAttempts,
 	}
 }
 

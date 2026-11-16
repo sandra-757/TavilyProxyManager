@@ -125,36 +125,72 @@ func (s *CacheService) CleanExpired(ctx context.Context) (int64, error) {
 	return result.RowsAffected, result.Error
 }
 
+// BuildCacheKey hashes the ENTIRE request body in canonical form (JSON
+// object keys sorted, numbers preserved). The previous implementation
+// hashed only six selected fields, so requests that differed in
+// time_range, include_answer, chunks_per_source etc. collided and were
+// served each other's results.
 func (s *CacheService) BuildCacheKey(body []byte) (string, string) {
-	var m map[string]any
-	if err := json.Unmarshal(body, &m); err != nil {
+	var decoded any
+	dec := json.NewDecoder(strings.NewReader(string(body)))
+	dec.UseNumber()
+	if err := dec.Decode(&decoded); err != nil {
 		return fmt.Sprintf("%x", sha256.Sum256(body)), ""
 	}
+	canonical, err := marshalCanonical(decoded)
+	if err != nil {
+		return fmt.Sprintf("%x", sha256.Sum256(body)), ""
+	}
+	query := ""
+	if m, ok := decoded.(map[string]any); ok {
+		query, _ = m["query"].(string)
+	}
+	return fmt.Sprintf("%x", sha256.Sum256(canonical)), query
+}
 
-	query, _ := m["query"].(string)
-
-	keyFields := map[string]any{}
-	for _, field := range []string{"query", "search_depth", "include_domains", "exclude_domains", "topic", "max_results"} {
-		if v, ok := m[field]; ok {
-			keyFields[field] = v
+// marshalCanonical renders a decoded JSON value deterministically: map
+// keys sorted, json.Number preserved verbatim.
+func marshalCanonical(v any) ([]byte, error) {
+	switch t := v.(type) {
+	case map[string]any:
+		keys := make([]string, 0, len(t))
+		for k := range t {
+			keys = append(keys, k)
 		}
+		sort.Strings(keys)
+		var sb strings.Builder
+		sb.WriteByte('{')
+		for i, k := range keys {
+			if i > 0 {
+				sb.WriteByte(',')
+			}
+			kb, _ := json.Marshal(k)
+			sb.Write(kb)
+			sb.WriteByte(':')
+			vb, err := marshalCanonical(t[k])
+			if err != nil {
+				return nil, err
+			}
+			sb.Write(vb)
+		}
+		sb.WriteByte('}')
+		return []byte(sb.String()), nil
+	case []any:
+		var sb strings.Builder
+		sb.WriteByte('[')
+		for i, e := range t {
+			if i > 0 {
+				sb.WriteByte(',')
+			}
+			eb, err := marshalCanonical(e)
+			if err != nil {
+				return nil, err
+			}
+			sb.Write(eb)
+		}
+		sb.WriteByte(']')
+		return []byte(sb.String()), nil
+	default:
+		return json.Marshal(v)
 	}
-
-	keys := make([]string, 0, len(keyFields))
-	for k := range keyFields {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-
-	var sb strings.Builder
-	for _, k := range keys {
-		v, _ := json.Marshal(keyFields[k])
-		sb.WriteString(k)
-		sb.WriteByte('=')
-		sb.Write(v)
-		sb.WriteByte('&')
-	}
-
-	hash := sha256.Sum256([]byte(sb.String()))
-	return fmt.Sprintf("%x", hash), query
 }

@@ -117,7 +117,8 @@ func main() {
 
 	tavilyProxy := services.NewTavilyProxy(cfg.TavilyBaseURL, cfg.UpstreamTimeout, keyService, logService, statsService, slogLogger).
 		WithSettings(settingsService).
-		WithMaxResponseBodyBytes(cfg.MaxResponseBodyBytes)
+		WithMaxResponseBodyBytes(cfg.MaxResponseBodyBytes).
+		WithMaxAttempts(cfg.ProxyMaxAttempts)
 	cacheService := services.NewCacheService(database, slogLogger)
 	tavilyProxy.WithCache(cacheService)
 	quotaSyncService := services.NewQuotaSyncService(keyService, tavilyProxy, slogLogger)
@@ -127,6 +128,7 @@ func main() {
 
 	srv := httpserver.New(httpserver.Dependencies{
 		AuthLimiter:      authLimiter,
+		Database:         database,
 		Config:           cfg,
 		EmbeddedPublic:   embeddedPublic,
 		MasterKeyService: masterKeyService,

@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -25,6 +26,8 @@ type TavilyProxy struct {
 	client  *http.Client
 
 	maxResponseBodyBytes int64
+	maxAttempts          int
+	rateLimitCooldown    time.Duration
 
 	settings *SettingsService
 	cache    *CacheService
@@ -59,6 +62,8 @@ func NewTavilyProxy(baseURL string, timeout time.Duration, keys *KeyService, log
 			Timeout: timeout,
 		},
 		maxResponseBodyBytes: DefaultMaxResponseBodyBytes,
+		maxAttempts:          DefaultMaxAttempts,
+		rateLimitCooldown:    DefaultRateLimitCooldown,
 		keys:                 keys,
 		logs:                 logs,
 		stats:                stats,
@@ -74,6 +79,27 @@ var ErrNoAvailableKeys = errors.New("no available keys")
 func (p *TavilyProxy) WithMaxResponseBodyBytes(n int64) *TavilyProxy {
 	if n > 0 {
 		p.maxResponseBodyBytes = n
+	}
+	return p
+}
+
+const DefaultMaxAttempts = 5
+const DefaultRateLimitCooldown = 60 * time.Second
+
+// WithMaxAttempts caps how many pool keys a single client request may try
+// (and therefore how long failover can keep it waiting).
+func (p *TavilyProxy) WithMaxAttempts(n int) *TavilyProxy {
+	if n > 0 {
+		p.maxAttempts = n
+	}
+	return p
+}
+
+// WithRateLimitCooldown sets how long a key is deprioritised after a 429
+// when the upstream sends no Retry-After header.
+func (p *TavilyProxy) WithRateLimitCooldown(d time.Duration) *TavilyProxy {
+	if d > 0 {
+		p.rateLimitCooldown = d
 	}
 	return p
 }
@@ -220,10 +246,50 @@ func (p *TavilyProxy) Do(ctx context.Context, req ProxyRequest) (ProxyResponse, 
 	var lastRateLimitedKeyID uint
 	var lastRateLimitedKeyAlias string
 	var lastRateLimitedLatency int64
+	maxAttempts := p.maxAttempts
+	if maxAttempts <= 0 {
+		maxAttempts = DefaultMaxAttempts
+	}
+	attempts := 0
 	for _, key := range candidates {
+		if attempts >= maxAttempts {
+			p.logger.Warn("proxy attempt budget exhausted",
+				"request_id", proxyReqID,
+				"max_attempts", maxAttempts,
+			)
+			break
+		}
+		attempts++
+
+		// Pre-charge the estimated credit cost atomically so concurrent
+		// requests cannot overspend the same key's remaining quota. The
+		// reservation is settled against the actual cost afterwards, or
+		// refunded when the call turns out not to be chargeable.
+		estCredits := estimateCredits(req)
+		reserved := 0
+		if estCredits > 0 {
+			ok, rerr := p.keys.Reserve(ctx, key.ID, estCredits)
+			if rerr != nil {
+				p.logger.Warn("quota reserve failed", "request_id", proxyReqID, "key_id", key.ID, "err", rerr)
+			} else if !ok {
+				continue
+			} else {
+				reserved = estCredits
+			}
+		}
+		refund := func() {
+			if reserved > 0 {
+				if err := p.keys.IncrementUsedBy(ctx, key.ID, -reserved); err != nil {
+					p.logger.Warn("quota refund failed", "request_id", proxyReqID, "key_id", key.ID, "err", err)
+				}
+				reserved = 0
+			}
+		}
+
 		resp, status, latencyMs, tavilyReqID, err := p.tryKey(ctx, key.ID, key.Key, req, proxyReqID)
 
 		if err != nil {
+			refund()
 			p.logger.Warn("upstream request failed",
 				"request_id", proxyReqID,
 				"key_id", key.ID,
@@ -236,6 +302,7 @@ func (p *TavilyProxy) Do(ctx context.Context, req ProxyRequest) (ProxyResponse, 
 
 		switch status {
 		case http.StatusUnauthorized:
+			refund()
 			p.logger.Warn("key marked invalid",
 				"request_id", proxyReqID,
 				"key_id", key.ID,
@@ -244,6 +311,12 @@ func (p *TavilyProxy) Do(ctx context.Context, req ProxyRequest) (ProxyResponse, 
 			_ = p.keys.MarkInvalid(ctx, key.ID)
 			continue
 		case http.StatusTooManyRequests:
+			refund()
+			cooldown := p.rateLimitCooldown
+			if ra := parseRetryAfter(resp.Headers.Get("Retry-After")); ra > 0 {
+				cooldown = ra
+			}
+			p.keys.MarkRateLimited(key.ID, cooldown)
 			p.logger.Warn("key rate limited",
 				"request_id", proxyReqID,
 				"key_id", key.ID,
@@ -269,8 +342,23 @@ func (p *TavilyProxy) Do(ctx context.Context, req ProxyRequest) (ProxyResponse, 
 			continue
 		}
 
-		if status == http.StatusOK && !strings.EqualFold(req.Method, http.MethodGet) {
-			_ = p.keys.IncrementUsed(ctx, key.ID)
+		// Settle the reservation against the real cost: Tavily reports
+		// usage.credits in successful responses; fall back to the
+		// estimate when it does not. Non-2xx outcomes are not charged.
+		if reserved > 0 {
+			if status >= 200 && status < 300 {
+				actual := estCredits
+				if c, ok := creditsFromResponse(resp.Body); ok {
+					actual = c
+				}
+				if delta := actual - reserved; delta != 0 {
+					if err := p.keys.IncrementUsedBy(ctx, key.ID, delta); err != nil {
+						p.logger.Warn("quota settle failed", "request_id", proxyReqID, "key_id", key.ID, "err", err)
+					}
+				}
+			} else {
+				refund()
+			}
 		}
 
 		createdAt := time.Now()
@@ -565,11 +653,11 @@ func (p *TavilyProxy) isCacheEnabled(ctx context.Context) bool {
 
 func (p *TavilyProxy) getCacheTTL(ctx context.Context) time.Duration {
 	if p.settings == nil {
-		return 43200 * time.Second
+		return 3600 * time.Second
 	}
-	seconds, err := p.settings.GetInt(ctx, SettingCacheTTLSeconds, 43200)
+	seconds, err := p.settings.GetInt(ctx, SettingCacheTTLSeconds, 3600)
 	if err != nil || seconds < 60 {
-		return 43200 * time.Second
+		return 3600 * time.Second
 	}
 	return time.Duration(seconds) * time.Second
 }
@@ -606,4 +694,68 @@ func (p *TavilyProxy) GetUsage(ctx context.Context, tavilyKey string) (int, *int
 		limit = out.Account.PlanLimit
 	}
 	return out.Key.Usage, limit, nil
+}
+
+// creditsFromResponse extracts Tavily's own accounting from a response
+// body: {"usage": {"credits": N}}. It is the source of truth for how much
+// a call actually cost.
+func creditsFromResponse(body []byte) (int, bool) {
+	var m struct {
+		Usage *struct {
+			Credits *int `json:"credits"`
+		} `json:"usage"`
+	}
+	if err := json.Unmarshal(body, &m); err != nil || m.Usage == nil || m.Usage.Credits == nil {
+		return 0, false
+	}
+	if *m.Usage.Credits < 0 {
+		return 0, false
+	}
+	return *m.Usage.Credits, true
+}
+
+// estimateCredits approximates Tavily's per-call credit cost from the
+// request, used to pre-charge a reservation and as the accounting
+// fallback when a response carries no usage block. Rules (Tavily pricing
+// docs): basic search 1, advanced search 2; extract 1 credit per 5 URLs
+// (basic) or 2 per 5 (advanced); other endpoints default to 1.
+func estimateCredits(req ProxyRequest) int {
+	if strings.EqualFold(req.Method, http.MethodGet) {
+		return 0
+	}
+	var body map[string]any
+	_ = json.Unmarshal(req.Body, &body)
+	switch req.Path {
+	case "/search":
+		if d, _ := body["search_depth"].(string); strings.EqualFold(d, "advanced") {
+			return 2
+		}
+		return 1
+	case "/extract":
+		urls, _ := body["urls"].([]any)
+		n := len(urls)
+		if n == 0 {
+			return 1
+		}
+		per := 1
+		if d, _ := body["extract_depth"].(string); strings.EqualFold(d, "advanced") {
+			per = 2
+		}
+		return (n + 4) / 5 * per
+	default:
+		return 1
+	}
+}
+
+// parseRetryAfter parses a Retry-After header value in seconds form.
+func parseRetryAfter(v string) time.Duration {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return 0
+	}
+	secs, err := strconv.Atoi(v)
+	if err != nil || secs <= 0 {
+		return 0
+	}
+	return time.Duration(secs) * time.Second
 }

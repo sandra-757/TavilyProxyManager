@@ -11,8 +11,11 @@ import (
 func StartMonthlyReset(ctx context.Context, keys *services.KeyService, logger *slog.Logger) {
 	go func() {
 		for {
-			now := time.Now()
-			nextMidnight := time.Date(now.Year(), now.Month(), now.Day()+1, 0, 0, 0, 0, now.Location())
+			// Tavily's billing month is anchored to UTC; resetting on a
+			// local timezone could clear the local ledger up to a day
+			// before/after the upstream quota actually refreshes.
+			now := time.Now().UTC()
+			nextMidnight := time.Date(now.Year(), now.Month(), now.Day()+1, 0, 0, 0, 0, time.UTC)
 			timer := time.NewTimer(time.Until(nextMidnight))
 			select {
 			case <-ctx.Done():

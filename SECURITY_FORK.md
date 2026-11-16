@@ -66,3 +66,42 @@ New/updated coverage: `secretbox` round-trip and wrong-key failure,
 encryption-at-rest for keys and tokens, token-tier separation at the
 service and HTTP layers, auth limiter threshold behaviour, and the
 query-string credential removal (updated legacy test).
+
+## P1/P2 improvements (branch fix/p1-p2-improvements)
+
+Correctness and operability fixes on top of the P0 branch:
+
+- **Credit-accurate accounting.** Usage is now charged from Tavily's own
+  `usage.credits` in the response (advanced search = 2, etc.). When a
+  response has no usage block, a per-endpoint estimate is used
+  (search 1/2 by depth, extract ceil(urls/5) x depth factor).
+- **No quota overspend under concurrency.** Each attempt atomically
+  reserves the estimated cost (`UPDATE ... WHERE used + n <= total`);
+  the reservation is settled against the actual cost on success and
+  refunded on 401/429/network errors and other non-2xx outcomes.
+- **Bounded failover.** At most 5 keys are tried per request
+  (`PROXY_MAX_ATTEMPTS`). A 429 puts the key into cooldown
+  (Retry-After honoured, default 60s); cooling keys are skipped while
+  any other key is available.
+- **SQLite contention.** WAL mode, busy_timeout 5s, single connection.
+- **Cache correctness.** The cache key now hashes the canonicalised
+  FULL request body (previously only 6 fields — requests differing in
+  `time_range`, `include_answer`, ... collided). Default TTL 12h -> 1h.
+- **JSON fidelity.** Stripping `api_key` from request bodies now uses
+  `json.Number`, so large/high-precision numbers survive the round trip.
+- **Monthly reset.** Runs on UTC (Tavily's billing anchor), and
+  `ResetAllUsage` actually works now (GORM refused the WHERE-less
+  global update before, so the reset had been failing silently).
+- **Readiness + metrics.** `/healthz` pings the database and returns
+  503 when it is unreachable. New admin-only `GET /api/metrics` returns
+  pool totals and per-status request counts as JSON.
+- **CI + supply chain.** GitHub Actions run `go vet`, `go test ./...`
+  and the frontend build; Dockerfile uses `npm ci`; compose pins the
+  image tag instead of `:latest` with `pull_policy: always`.
+- **Removed `register/`.** The batch account-registration tooling
+  (ToS-risky, unrelated to the proxy) and committed `__pycache__`
+  artifacts are deleted from this fork; `.gitignore` covers them.
+
+Known remaining limitation: responses are still fully buffered (no
+streaming passthrough for `/research` SSE); the 50 MiB response cap
+from the P0 branch bounds the memory impact.

@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"math/rand"
 	"sort"
+	"sync"
 	"time"
 
 	"tavily-proxy/server/internal/models"
@@ -18,6 +19,9 @@ type KeyService struct {
 	db     *gorm.DB
 	logger *slog.Logger
 	cipher *secretbox.Cipher
+
+	mu            sync.Mutex
+	cooldownUntil map[uint]time.Time
 }
 
 func NewKeyService(db *gorm.DB, logger *slog.Logger) *KeyService {
@@ -185,15 +189,72 @@ func (s *KeyService) MarkExhausted(ctx context.Context, id uint) error {
 }
 
 func (s *KeyService) IncrementUsed(ctx context.Context, id uint) error {
+	return s.IncrementUsedBy(ctx, id, 1)
+}
+
+// IncrementUsedBy adjusts the locally tracked usage by delta (positive or
+// negative), clamped to [0, total_quota]. Negative deltas refund a prior
+// reservation when an upstream call turns out not to be chargeable.
+func (s *KeyService) IncrementUsedBy(ctx context.Context, id uint, delta int) error {
+	if delta == 0 {
+		return nil
+	}
 	now := time.Now()
+	var expr string
+	if delta > 0 {
+		expr = "CASE WHEN used_quota + ? > total_quota THEN total_quota ELSE used_quota + ? END"
+	} else {
+		expr = "CASE WHEN used_quota + ? < 0 THEN 0 ELSE used_quota + ? END"
+	}
 	return s.db.WithContext(ctx).Model(&models.APIKey{}).Where("id = ?", id).Updates(map[string]any{
-		"used_quota":   gorm.Expr("CASE WHEN used_quota + 1 > total_quota THEN total_quota ELSE used_quota + 1 END"),
+		"used_quota":   gorm.Expr(expr, delta, delta),
 		"last_used_at": &now,
 	}).Error
 }
 
+// Reserve atomically pre-charges n credits to a key before an upstream
+// call, so concurrent requests cannot all spend the same remaining quota.
+// It reports false when the key does not have n credits left.
+func (s *KeyService) Reserve(ctx context.Context, id uint, n int) (bool, error) {
+	if n <= 0 {
+		return true, nil
+	}
+	now := time.Now()
+	res := s.db.WithContext(ctx).Model(&models.APIKey{}).
+		Where("id = ? AND used_quota + ? <= total_quota", id, n).
+		Updates(map[string]any{
+			"used_quota":   gorm.Expr("used_quota + ?", n),
+			"last_used_at": &now,
+		})
+	if res.Error != nil {
+		return false, res.Error
+	}
+	return res.RowsAffected == 1, nil
+}
+
+// MarkRateLimited puts a key into cooldown after a 429. Candidates()
+// deprioritises cooling keys while any other key is available.
+func (s *KeyService) MarkRateLimited(id uint, d time.Duration) {
+	if d <= 0 {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.cooldownUntil == nil {
+		s.cooldownUntil = make(map[uint]time.Time)
+	}
+	s.cooldownUntil[id] = time.Now().Add(d)
+}
+
+func (s *KeyService) coolingDown(id uint) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	until, ok := s.cooldownUntil[id]
+	return ok && time.Now().Before(until)
+}
+
 func (s *KeyService) ResetAllUsage(ctx context.Context) error {
-	return s.db.WithContext(ctx).Model(&models.APIKey{}).Update("used_quota", 0).Error
+	return s.db.WithContext(ctx).Model(&models.APIKey{}).Where("1 = 1").Update("used_quota", 0).Error
 }
 
 func (s *KeyService) SetUsage(ctx context.Context, id uint, used int, total *int) error {
@@ -218,6 +279,17 @@ func (s *KeyService) Candidates(ctx context.Context) ([]models.APIKey, error) {
 	}
 	if len(keys) == 0 {
 		return nil, nil
+	}
+	// Deprioritise keys in 429 cooldown while any other key is usable;
+	// if every key is cooling down, fall back to the full set.
+	available := make([]models.APIKey, 0, len(keys))
+	for _, k := range keys {
+		if !s.coolingDown(k.ID) {
+			available = append(available, k)
+		}
+	}
+	if len(available) > 0 {
+		keys = available
 	}
 	for i := range keys {
 		s.decryptRecord(&keys[i])
