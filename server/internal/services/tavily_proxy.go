@@ -18,9 +18,13 @@ import (
 	"tavily-proxy/server/internal/models"
 )
 
+const DefaultMaxResponseBodyBytes int64 = 50 << 20
+
 type TavilyProxy struct {
 	baseURL string
 	client  *http.Client
+
+	maxResponseBodyBytes int64
 
 	settings *SettingsService
 	cache    *CacheService
@@ -54,15 +58,40 @@ func NewTavilyProxy(baseURL string, timeout time.Duration, keys *KeyService, log
 		client: &http.Client{
 			Timeout: timeout,
 		},
-		keys:     keys,
-		logs:     logs,
-		stats:    stats,
-		logger:   logger,
-		settings: nil,
+		maxResponseBodyBytes: DefaultMaxResponseBodyBytes,
+		keys:                 keys,
+		logs:                 logs,
+		stats:                stats,
+		logger:               logger,
+		settings:             nil,
 	}
 }
 
 var ErrNoAvailableKeys = errors.New("no available keys")
+
+// WithMaxResponseBodyBytes caps how much of an upstream response body is
+// buffered in memory; larger responses are rejected instead of exhausting RAM.
+func (p *TavilyProxy) WithMaxResponseBodyBytes(n int64) *TavilyProxy {
+	if n > 0 {
+		p.maxResponseBodyBytes = n
+	}
+	return p
+}
+
+func (p *TavilyProxy) readBodyLimited(r io.Reader) ([]byte, error) {
+	limit := p.maxResponseBodyBytes
+	if limit <= 0 {
+		limit = DefaultMaxResponseBodyBytes
+	}
+	body, err := io.ReadAll(io.LimitReader(r, limit+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(body)) > limit {
+		return nil, fmt.Errorf("upstream response exceeds %d bytes", limit)
+	}
+	return body, nil
+}
 
 func (p *TavilyProxy) WithSettings(settings *SettingsService) *TavilyProxy {
 	p.settings = settings
@@ -434,7 +463,7 @@ func (p *TavilyProxy) tryKey(ctx context.Context, keyID uint, tavilyKey string, 
 		"key_id", keyID,
 	)
 
-	body, err := io.ReadAll(upstreamResp.Body)
+	body, err := p.readBodyLimited(upstreamResp.Body)
 	if err != nil {
 		p.logger.Warn("upstream response read error",
 			"request_id", proxyReqID,
@@ -559,7 +588,7 @@ func (p *TavilyProxy) GetUsage(ctx context.Context, tavilyKey string) (int, *int
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := p.readBodyLimited(resp.Body)
 	if err != nil {
 		return 0, nil, err
 	}

@@ -3,19 +3,21 @@ import { ref } from 'vue'
 
 const STORAGE_KEY = 'tavily_proxy_master_key'
 
-const masterKeyRef = ref<string>(localStorage.getItem(STORAGE_KEY) ?? '')
+// The admin (master) key is kept in sessionStorage, not localStorage: it
+// disappears when the tab closes instead of persisting on disk indefinitely.
+const masterKeyRef = ref<string>(sessionStorage.getItem(STORAGE_KEY) ?? '')
 
 export function getMasterKey(): string {
   return masterKeyRef.value
 }
 
 export function setMasterKey(value: string): void {
-  localStorage.setItem(STORAGE_KEY, value)
+  sessionStorage.setItem(STORAGE_KEY, value)
   masterKeyRef.value = value
 }
 
 export function clearMasterKey(): void {
-  localStorage.removeItem(STORAGE_KEY)
+  sessionStorage.removeItem(STORAGE_KEY)
   masterKeyRef.value = ''
 }
 

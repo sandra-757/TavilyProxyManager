@@ -145,27 +145,23 @@ func TestProxy_LegacyBodyAPIKey_MasterKey_StripsFieldAndUsesPoolKey(t *testing.T
 	}
 }
 
-func TestProxy_LegacyQueryAPIKey_MasterKey_StripsParamAndUsesPoolKey(t *testing.T) {
+func TestProxy_QueryAPIKey_NoLongerAcceptedAsCredential(t *testing.T) {
+	// Security change (fork): an api_key in the URL query string is no
+	// longer accepted as a credential, because URLs are routinely logged
+	// by proxies and servers. The parameter is still stripped before any
+	// upstream forwarding. Clients must use the Authorization header or
+	// the JSON body field instead.
 	t.Parallel()
 
 	gin.SetMode(gin.TestMode)
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
 	const poolKey = "tvly-pool-1234567890abcdef"
+	var upstreamCalls int32
 
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if got := r.Header.Get("Authorization"); got != "Bearer "+poolKey {
-			t.Fatalf("unexpected Authorization header: got %q want %q", got, "Bearer "+poolKey)
-		}
-		if got := r.URL.Query().Get("api_key"); got != "" {
-			t.Fatalf("api_key should be stripped from upstream query, got %q", got)
-		}
-		if got := r.URL.Query().Get("foo"); got != "bar" {
-			t.Fatalf("unexpected foo query: got %q want %q", got, "bar")
-		}
-		w.Header().Set("Content-Type", "application/json")
+		atomic.AddInt32(&upstreamCalls, 1)
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{"key":{"usage":0,"limit":1000}}`))
 	}))
 	t.Cleanup(upstream.Close)
 
@@ -202,7 +198,10 @@ func TestProxy_LegacyQueryAPIKey_MasterKey_StripsParamAndUsesPoolKey(t *testing.
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, req)
 
-	if w.Code != http.StatusOK {
-		t.Fatalf("unexpected status: got %d want %d (body=%q)", w.Code, http.StatusOK, w.Body.String())
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("unexpected status: got %d want %d (body=%q)", w.Code, http.StatusUnauthorized, w.Body.String())
+	}
+	if got := atomic.LoadInt32(&upstreamCalls); got != 0 {
+		t.Fatalf("upstream should not be called, got %d calls", got)
 	}
 }

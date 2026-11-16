@@ -15,6 +15,12 @@ type Config struct {
 	MCPSessionTTL   time.Duration
 	LogDir          string // log file directory; empty = stdout only
 	LogLevel        string // debug/info/warn/error
+
+	// Security hardening (fork).
+	EncryptionKey        string // TPM_ENCRYPTION_KEY: base64 32-byte key; empty = use key file
+	EncryptionKeyFile    string // TPM_ENCRYPTION_KEY_FILE; empty = <db dir>/encryption.key
+	MaxRequestBodyBytes  int64  // MAX_REQUEST_BODY_BYTES, default 10 MiB
+	MaxResponseBodyBytes int64  // MAX_RESPONSE_BODY_BYTES, default 50 MiB
 }
 
 func FromEnv() Config {
@@ -31,16 +37,24 @@ func FromEnv() Config {
 	mcpSessionTTL := getenvDuration("MCP_SESSION_TTL", 10*time.Minute)
 	logDir := getenv("LOG_DIR", "")
 	logLevel := getenv("LOG_LEVEL", "info")
+	encryptionKey := getenv("TPM_ENCRYPTION_KEY", "")
+	encryptionKeyFile := getenv("TPM_ENCRYPTION_KEY_FILE", "")
+	maxReqBody := getenvInt64("MAX_REQUEST_BODY_BYTES", 10<<20)
+	maxRespBody := getenvInt64("MAX_RESPONSE_BODY_BYTES", 50<<20)
 
 	return Config{
-		ListenAddr:      listenAddr,
-		DatabasePath:    dbPath,
-		TavilyBaseURL:   baseURL,
-		UpstreamTimeout: timeout,
-		MCPStateless:    mcpStateless,
-		MCPSessionTTL:   mcpSessionTTL,
-		LogDir:          logDir,
-		LogLevel:        logLevel,
+		ListenAddr:           listenAddr,
+		DatabasePath:         dbPath,
+		TavilyBaseURL:        baseURL,
+		UpstreamTimeout:      timeout,
+		MCPStateless:         mcpStateless,
+		MCPSessionTTL:        mcpSessionTTL,
+		LogDir:               logDir,
+		LogLevel:             logLevel,
+		EncryptionKey:        encryptionKey,
+		EncryptionKeyFile:    encryptionKeyFile,
+		MaxRequestBodyBytes:  maxReqBody,
+		MaxResponseBodyBytes: maxRespBody,
 	}
 }
 
@@ -67,6 +81,15 @@ func getenvDuration(key string, def time.Duration) time.Duration {
 		}
 		if seconds, err := strconv.Atoi(v); err == nil {
 			return time.Duration(seconds) * time.Second
+		}
+	}
+	return def
+}
+
+func getenvInt64(key string, def int64) int64 {
+	if v := os.Getenv(key); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
+			return n
 		}
 	}
 	return def

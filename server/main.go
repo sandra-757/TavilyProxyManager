@@ -11,11 +11,14 @@ import (
 	"syscall"
 	"time"
 
+	"path/filepath"
+
 	"tavily-proxy/server/internal/config"
 	"tavily-proxy/server/internal/db"
 	"tavily-proxy/server/internal/httpserver"
 	"tavily-proxy/server/internal/jobs"
 	"tavily-proxy/server/internal/logger"
+	"tavily-proxy/server/internal/secretbox"
 	"tavily-proxy/server/internal/services"
 )
 
@@ -48,20 +51,63 @@ func main() {
 
 	slogLogger := slog.New(slog.NewTextHandler(w, &slog.HandlerOptions{Level: level}))
 
+	// Encryption at rest: resolve the data-encryption key before anything
+	// touches stored secrets. TPM_ENCRYPTION_KEY wins; otherwise a key file
+	// next to the database is loaded or created (0600). The key value is
+	// never logged.
+	dbDir := filepath.Dir(cfg.DatabasePath)
+	var encKey []byte
+	if cfg.EncryptionKey != "" {
+		k, err := secretbox.ParseKey(cfg.EncryptionKey)
+		if err != nil {
+			slogLogger.Error("invalid TPM_ENCRYPTION_KEY", "err", err)
+			os.Exit(1)
+		}
+		encKey = k
+	} else {
+		keyFile := cfg.EncryptionKeyFile
+		if keyFile == "" {
+			keyFile = filepath.Join(dbDir, "encryption.key")
+		}
+		k, created, err := secretbox.LoadOrCreateKeyFile(keyFile)
+		if err != nil {
+			slogLogger.Error("encryption key load failed", "err", err)
+			os.Exit(1)
+		}
+		if created {
+			slogLogger.Info("generated new encryption key file (keep it safe; losing it makes stored keys unreadable)", "file", keyFile)
+		}
+		encKey = k
+	}
+	cipher, err := secretbox.New(encKey)
+	if err != nil {
+		slogLogger.Error("encryption init failed", "err", err)
+		os.Exit(1)
+	}
+
 	database, err := db.Open(cfg.DatabasePath)
 	if err != nil {
 		slogLogger.Error("db open failed", "err", err)
 		os.Exit(1)
 	}
 
-	masterKeyService := services.NewMasterKeyService(database, slogLogger)
+	masterKeyService := services.NewMasterKeyService(database, slogLogger).
+		WithCipher(cipher).
+		WithInitialKeyFiles(filepath.Join(dbDir, "initial-admin-key.txt"), filepath.Join(dbDir, "initial-proxy-key.txt"))
 	if err := masterKeyService.LoadOrCreate(context.Background()); err != nil {
 		slogLogger.Error("master key init failed", "err", err)
 		os.Exit(1)
 	}
 
 	settingsService := services.NewSettingsService(database)
-	keyService := services.NewKeyService(database, slogLogger)
+	keyService := services.NewKeyService(database, slogLogger).WithCipher(cipher)
+
+	if migrated, err := keyService.EncryptAllPlaintext(context.Background()); err != nil {
+		slogLogger.Error("api key encryption migration failed", "err", err)
+	} else if migrated > 0 {
+		slogLogger.Info("migrated plaintext api keys to encrypted form", "count", migrated)
+	}
+
 	logService := services.NewLogService(database, slogLogger)
 	statsService := services.NewStatsService(database)
 
@@ -70,13 +116,17 @@ func main() {
 	}
 
 	tavilyProxy := services.NewTavilyProxy(cfg.TavilyBaseURL, cfg.UpstreamTimeout, keyService, logService, statsService, slogLogger).
-		WithSettings(settingsService)
+		WithSettings(settingsService).
+		WithMaxResponseBodyBytes(cfg.MaxResponseBodyBytes)
 	cacheService := services.NewCacheService(database, slogLogger)
 	tavilyProxy.WithCache(cacheService)
 	quotaSyncService := services.NewQuotaSyncService(keyService, tavilyProxy, slogLogger)
 	quotaSyncJob := services.NewQuotaSyncJobService(keyService, quotaSyncService, slogLogger)
 
+	authLimiter := services.DefaultAuthLimiter()
+
 	srv := httpserver.New(httpserver.Dependencies{
+		AuthLimiter:      authLimiter,
 		Config:           cfg,
 		EmbeddedPublic:   embeddedPublic,
 		MasterKeyService: masterKeyService,

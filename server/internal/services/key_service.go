@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"tavily-proxy/server/internal/models"
+	"tavily-proxy/server/internal/secretbox"
 
 	"gorm.io/gorm"
 )
@@ -16,10 +17,44 @@ import (
 type KeyService struct {
 	db     *gorm.DB
 	logger *slog.Logger
+	cipher *secretbox.Cipher
 }
 
 func NewKeyService(db *gorm.DB, logger *slog.Logger) *KeyService {
 	return &KeyService{db: db, logger: logger}
+}
+
+// WithCipher enables AES-GCM encryption of API keys at rest. Records are
+// decrypted in memory on every read path; the database only ever holds the
+// "enc:v1:" ciphertext form (legacy plaintext rows are re-encrypted on the
+// next save of that record).
+func (s *KeyService) WithCipher(c *secretbox.Cipher) *KeyService {
+	s.cipher = c
+	return s
+}
+
+func (s *KeyService) encryptKey(plain string) string {
+	if s.cipher == nil {
+		return plain
+	}
+	enc, err := s.cipher.Encrypt(plain)
+	if err != nil {
+		s.logger.Error("api key encryption failed", "err", err)
+		return plain
+	}
+	return enc
+}
+
+func (s *KeyService) decryptRecord(k *models.APIKey) {
+	if s.cipher == nil || k == nil {
+		return
+	}
+	dec, err := s.cipher.Decrypt(k.Key)
+	if err != nil {
+		s.logger.Error("api key decryption failed", "key_id", k.ID, "err", err)
+		return
+	}
+	k.Key = dec
 }
 
 func (s *KeyService) List(ctx context.Context) ([]models.APIKey, error) {
@@ -27,12 +62,30 @@ func (s *KeyService) List(ctx context.Context) ([]models.APIKey, error) {
 	if err := s.db.WithContext(ctx).Order("id desc").Find(&keys).Error; err != nil {
 		return nil, err
 	}
+	for i := range keys {
+		s.decryptRecord(&keys[i])
+	}
 	return keys, nil
 }
+
+var ErrDuplicateKey = errors.New("duplicate api key")
 
 func (s *KeyService) Create(ctx context.Context, key, alias string, totalQuota int) (*models.APIKey, error) {
 	if totalQuota <= 0 {
 		totalQuota = 1000
+	}
+	if s.cipher != nil {
+		// Ciphertext is randomised, so the DB unique index can no longer
+		// detect duplicate plaintext keys; check explicitly instead.
+		existing, err := s.List(ctx)
+		if err != nil {
+			return nil, err
+		}
+		for _, e := range existing {
+			if e.Key == key {
+				return nil, ErrDuplicateKey
+			}
+		}
 	}
 	record := models.APIKey{
 		Key:        key,
@@ -42,9 +95,14 @@ func (s *KeyService) Create(ctx context.Context, key, alias string, totalQuota i
 		IsActive:   true,
 		IsInvalid:  false,
 	}
-	if err := s.db.WithContext(ctx).Create(&record).Error; err != nil {
+	stored := record
+	stored.Key = s.encryptKey(key)
+	if err := s.db.WithContext(ctx).Create(&stored).Error; err != nil {
 		return nil, err
 	}
+	record.ID = stored.ID
+	record.CreatedAt = stored.CreatedAt
+	record.UpdatedAt = stored.UpdatedAt
 	return &record, nil
 }
 
@@ -53,6 +111,7 @@ func (s *KeyService) Get(ctx context.Context, id uint) (*models.APIKey, error) {
 	if err := s.db.WithContext(ctx).First(&key, id).Error; err != nil {
 		return nil, err
 	}
+	s.decryptRecord(&key)
 	return &key, nil
 }
 
@@ -90,9 +149,17 @@ func (s *KeyService) Update(ctx context.Context, id uint, upd KeyUpdate) (*model
 		key.UsedQuota = 0
 	}
 
+	plainKey := key.Key
+	if s.cipher != nil {
+		if dec, err := s.cipher.Decrypt(key.Key); err == nil {
+			plainKey = dec
+		}
+	}
+	key.Key = s.encryptKey(plainKey)
 	if err := s.db.WithContext(ctx).Save(&key).Error; err != nil {
 		return nil, err
 	}
+	key.Key = plainKey
 	return &key, nil
 }
 
@@ -152,6 +219,9 @@ func (s *KeyService) Candidates(ctx context.Context) ([]models.APIKey, error) {
 	if len(keys) == 0 {
 		return nil, nil
 	}
+	for i := range keys {
+		s.decryptRecord(&keys[i])
+	}
 
 	type scored struct {
 		key       models.APIKey
@@ -184,6 +254,34 @@ func (s *KeyService) Candidates(ctx context.Context) ([]models.APIKey, error) {
 	return out, nil
 }
 
+// EncryptAllPlaintext rewrites any legacy plaintext API keys in the
+// database to encrypted form. Called once at startup when a cipher is
+// configured; a no-op afterwards.
+func (s *KeyService) EncryptAllPlaintext(ctx context.Context) (int, error) {
+	if s.cipher == nil {
+		return 0, nil
+	}
+	var keys []models.APIKey
+	if err := s.db.WithContext(ctx).Find(&keys).Error; err != nil {
+		return 0, err
+	}
+	migrated := 0
+	for _, k := range keys {
+		if secretbox.IsEncrypted(k.Key) {
+			continue
+		}
+		enc := s.encryptKey(k.Key)
+		if enc == k.Key {
+			continue
+		}
+		if err := s.db.WithContext(ctx).Model(&models.APIKey{}).Where("id = ?", k.ID).Update("key", enc).Error; err != nil {
+			return migrated, err
+		}
+		migrated++
+	}
+	return migrated, nil
+}
+
 func (s *KeyService) FindByID(ctx context.Context, id uint) (*models.APIKey, error) {
 	var key models.APIKey
 	if err := s.db.WithContext(ctx).First(&key, id).Error; err != nil {
@@ -192,6 +290,7 @@ func (s *KeyService) FindByID(ctx context.Context, id uint) (*models.APIKey, err
 		}
 		return nil, err
 	}
+	s.decryptRecord(&key)
 	return &key, nil
 }
 

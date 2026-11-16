@@ -26,12 +26,18 @@ func NewRouter(deps Dependencies) http.Handler {
 
 	publicFS, _ := fs.Sub(deps.EmbeddedPublic, "public")
 
+	authLimiter := deps.AuthLimiter
+	if authLimiter == nil {
+		authLimiter = services.DefaultAuthLimiter()
+	}
+
 	mcpHandler := mcpserver.NewHandler(mcpserver.Dependencies{
-		MasterKey:  deps.MasterKeyService,
-		Proxy:      deps.TavilyProxy,
-		Stats:      deps.StatsService,
-		Stateless:  deps.Config.MCPStateless,
-		SessionTTL: deps.Config.MCPSessionTTL,
+		MasterKey:   deps.MasterKeyService,
+		Proxy:       deps.TavilyProxy,
+		Stats:       deps.StatsService,
+		Stateless:   deps.Config.MCPStateless,
+		SessionTTL:  deps.Config.MCPSessionTTL,
+		AuthLimiter: authLimiter,
 	})
 	r.Any("/mcp", gin.WrapH(mcpHandler))
 
@@ -39,7 +45,7 @@ func NewRouter(deps Dependencies) http.Handler {
 		c.JSON(http.StatusOK, gin.H{"ok": true})
 	})
 
-	api := r.Group("/api", masterAuthMiddleware(deps.MasterKeyService))
+	api := r.Group("/api", masterAuthMiddleware(deps.MasterKeyService, authLimiter))
 	{
 		api.GET("/keys", func(c *gin.Context) { handleListKeys(c, deps.KeyService) })
 		api.POST("/keys", func(c *gin.Context) { handleCreateKey(c, deps.KeyService) })
@@ -69,6 +75,18 @@ func NewRouter(deps Dependencies) http.Handler {
 			c.JSON(http.StatusOK, gin.H{"master_key": newKey})
 		})
 
+		api.GET("/settings/proxy-key", func(c *gin.Context) {
+			c.JSON(http.StatusOK, gin.H{"proxy_key": deps.MasterKeyService.GetProxy()})
+		})
+		api.POST("/settings/proxy-key/reset", func(c *gin.Context) {
+			newKey, err := deps.MasterKeyService.ResetProxy(c.Request.Context())
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "reset_failed"})
+				return
+			}
+			c.JSON(http.StatusOK, gin.H{"proxy_key": newKey})
+		})
+
 		api.GET("/settings/auto-sync", func(c *gin.Context) { handleGetAutoSync(c, deps.SettingsService) })
 		api.PUT("/settings/auto-sync", func(c *gin.Context) { handleSetAutoSync(c, deps.SettingsService) })
 		api.GET("/settings/log-cleanup", func(c *gin.Context) { handleGetLogCleanup(c, deps.SettingsService) })
@@ -91,18 +109,40 @@ func NewRouter(deps Dependencies) http.Handler {
 			return
 		}
 
-		body, _ := io.ReadAll(c.Request.Body)
+		if authLimiter.Blocked(c.ClientIP()) {
+			c.JSON(http.StatusTooManyRequests, gin.H{"error": "too_many_auth_failures"})
+			return
+		}
+
+		maxBody := deps.Config.MaxRequestBodyBytes
+		if maxBody <= 0 {
+			maxBody = 10 << 20
+		}
+		body, err := io.ReadAll(io.LimitReader(c.Request.Body, maxBody+1))
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "read_body_failed"})
+			return
+		}
+		if int64(len(body)) > maxBody {
+			c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "request_body_too_large"})
+			return
+		}
 
 		authHeaderToken := parseBearerToken(c.GetHeader("Authorization"))
-		apiKeyFromQuery, sanitizedQuery := stripAPIKeyFromRawQuery(c.Request.URL.RawQuery)
+		// api_key in the URL query is still stripped before forwarding (so a
+		// leaked key never reaches upstream logs), but it is NO LONGER
+		// accepted as a credential: URLs end up in access logs and proxies.
+		_, sanitizedQuery := stripAPIKeyFromRawQuery(c.Request.URL.RawQuery)
 		apiKeyFromBody, sanitizedBody := stripAPIKeyFromJSON(body)
 
-		hasCredential := authHeaderToken != "" || apiKeyFromBody != "" || apiKeyFromQuery != ""
-		if deps.MasterKeyService.Authenticate(authHeaderToken) || deps.MasterKeyService.Authenticate(apiKeyFromBody) || deps.MasterKeyService.Authenticate(apiKeyFromQuery) {
+		hasCredential := authHeaderToken != "" || apiKeyFromBody != ""
+		if deps.MasterKeyService.AuthenticateProxy(authHeaderToken) || deps.MasterKeyService.AuthenticateProxy(apiKeyFromBody) {
+			authLimiter.Success(c.ClientIP())
 			handleProxy(c, deps.TavilyProxy, sanitizedBody, sanitizedQuery)
 			return
 		}
 		if hasCredential {
+			authLimiter.Fail(c.ClientIP())
 			respondUnauthorized(c)
 			return
 		}
@@ -121,14 +161,21 @@ func NewRouter(deps Dependencies) http.Handler {
 	return r
 }
 
-func masterAuthMiddleware(master *services.MasterKeyService) gin.HandlerFunc {
+func masterAuthMiddleware(master *services.MasterKeyService, limiter *services.AuthLimiter) gin.HandlerFunc {
 	return func(c *gin.Context) {
+		if limiter.Blocked(c.ClientIP()) {
+			c.JSON(http.StatusTooManyRequests, gin.H{"error": "too_many_auth_failures"})
+			c.Abort()
+			return
+		}
 		token := parseBearerToken(c.GetHeader("Authorization"))
 		if !master.Authenticate(token) {
+			limiter.Fail(c.ClientIP())
 			respondUnauthorized(c)
 			c.Abort()
 			return
 		}
+		limiter.Success(c.ClientIP())
 		c.Next()
 	}
 }

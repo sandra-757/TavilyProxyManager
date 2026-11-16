@@ -18,10 +18,15 @@ COPY --from=frontend-builder /web/dist/ server/public/
 RUN go build -o tavily-proxy server/main.go
 
 # Stage 3: Final image
-FROM alpine:latest
+FROM alpine:3.20
 RUN apk --no-cache add ca-certificates tzdata
 WORKDIR /app
 COPY --from=backend-builder /app/tavily-proxy .
+
+# Run as an unprivileged user; /app/data holds the SQLite DB, the
+# encryption key file and the one-time initial key files.
+RUN addgroup -S app && adduser -S app -G app && mkdir -p /app/data && chown -R app:app /app
+USER app
 
 VOLUME /app/data
 ENV DATABASE_PATH=/app/data/proxy.db

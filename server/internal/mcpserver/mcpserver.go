@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -14,11 +15,12 @@ import (
 )
 
 type Dependencies struct {
-	MasterKey  *services.MasterKeyService
-	Proxy      *services.TavilyProxy
-	Stats      *services.StatsService
-	Stateless  bool
-	SessionTTL time.Duration
+	MasterKey   *services.MasterKeyService
+	Proxy       *services.TavilyProxy
+	Stats       *services.StatsService
+	Stateless   bool
+	SessionTTL  time.Duration
+	AuthLimiter *services.AuthLimiter
 }
 
 func NewHandler(deps Dependencies) http.Handler {
@@ -61,11 +63,23 @@ func NewHandler(deps Dependencies) http.Handler {
 	})
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		client := r.RemoteAddr
+		if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+			client = host
+		}
+		if deps.AuthLimiter.Blocked(client) {
+			http.Error(w, "too many auth failures", http.StatusTooManyRequests)
+			return
+		}
 		token := parseBearerToken(r.Header.Get("Authorization"))
-		if !deps.MasterKey.Authenticate(token) {
+		// MCP is part of the proxy surface: the proxy token works here,
+		// the admin token works everywhere.
+		if !deps.MasterKey.AuthenticateProxy(token) {
+			deps.AuthLimiter.Fail(client)
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
+		deps.AuthLimiter.Success(client)
 		base.ServeHTTP(w, r)
 	})
 }
