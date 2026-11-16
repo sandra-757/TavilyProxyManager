@@ -57,6 +57,51 @@
         </n-card>
       </n-gi>
 
+
+      <n-gi>
+        <n-card :title="t('settings.proxyAuth.title')" class="settings-card">
+          <template #header-extra>
+            <n-icon :component="KeyOutline" size="20" />
+          </template>
+          <n-space vertical size="large">
+            <n-alert type="info" :show-icon="true" size="small">
+              {{ t("settings.proxyAuth.alert") }}
+            </n-alert>
+            <div>
+              <div class="field-label">{{ t("settings.proxyAuth.currentKey") }}</div>
+              <n-input-group>
+                <n-input
+                  :value="proxyKey"
+                  readonly
+                  type="password"
+                  show-password-on="mousedown"
+                  :placeholder="t('settings.proxyAuth.noKey')"
+                />
+                <n-button
+                  type="primary"
+                  ghost
+                  @click="copyProxy"
+                  :disabled="!proxyKey"
+                >
+                  <template #icon><n-icon :component="CopyOutline" /></template>
+                </n-button>
+              </n-input-group>
+            </div>
+            <n-popconfirm @positive-click="resetProxyKey">
+              <template #trigger>
+                <n-button block type="error" secondary>
+                  <template #icon
+                    ><n-icon :component="RefreshOutline"
+                  /></template>
+                  {{ t("settings.proxyAuth.reset") }}
+                </n-button>
+              </template>
+              {{ t("settings.proxyAuth.resetConfirm") }}
+            </n-popconfirm>
+          </n-space>
+        </n-card>
+      </n-gi>
+
       <n-gi>
         <n-card :title="t('settings.autoSync.title')" class="settings-card">
           <template #header-extra>
@@ -287,6 +332,7 @@ import {
 } from "naive-ui";
 import {
   CopyOutline,
+  KeyOutline,
   LockClosedOutline,
   RefreshOutline,
   ServerOutline,
@@ -300,6 +346,7 @@ import { locale, t } from "../i18n";
 const message = useMessage();
 const appVersion = __APP_VERSION__;
 const masterKey = ref("");
+const proxyKey = ref("");
 const savingAutoSync = ref(false);
 const savingLogCleanup = ref(false);
 const savingCache = ref(false);
@@ -529,6 +576,38 @@ async function copy() {
   }
 }
 
+async function loadProxyKey() {
+  try {
+    const { data } = await api.get<{ proxy_key: string }>(
+      "/api/settings/proxy-key"
+    );
+    proxyKey.value = data.proxy_key;
+  } catch (err: any) {
+    message.error(err?.response?.data?.error ?? t("settings.errors.loadProxyKey"));
+  }
+}
+
+async function copyProxy() {
+  try {
+    await writeClipboardText(proxyKey.value);
+    message.success(t("common.copiedToClipboard"));
+  } catch {
+    message.error(t("common.copyFailed"));
+  }
+}
+
+async function resetProxyKey() {
+  try {
+    const { data } = await api.post<{ proxy_key: string }>(
+      "/api/settings/proxy-key/reset"
+    );
+    proxyKey.value = data.proxy_key;
+    message.success(t("settings.messages.proxyKeyReset"));
+  } catch (err: any) {
+    message.error(err?.response?.data?.error ?? t("common.resetFailed"));
+  }
+}
+
 async function resetKey() {
   try {
     const { data } = await api.post<{ master_key: string }>(
@@ -544,6 +623,7 @@ async function resetKey() {
 
 onMounted(async () => {
   await load();
+  await loadProxyKey();
   await loadAutoSync();
   await loadLogCleanup();
   await loadCache();

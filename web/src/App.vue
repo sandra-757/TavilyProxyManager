@@ -90,7 +90,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, h, onMounted, ref } from "vue";
+import { computed, defineAsyncComponent, h, onMounted, ref } from "vue";
 import {
   NButton,
   NConfigProvider,
@@ -123,10 +123,12 @@ import {
   SunnyOutline,
 } from "@vicons/ionicons5";
 import MasterKeyModal from "./components/MasterKeyModal.vue";
-import DashboardView from "./views/DashboardView.vue";
-import KeyManagementView from "./views/KeyManagementView.vue";
-import LogsView from "./views/LogsView.vue";
-import SettingsView from "./views/SettingsView.vue";
+// Views are lazy-loaded so the initial bundle stays small; the heavy
+// dashboard (echarts) and the management views load on first use.
+const DashboardView = defineAsyncComponent(() => import("./views/DashboardView.vue"));
+const KeyManagementView = defineAsyncComponent(() => import("./views/KeyManagementView.vue"));
+const LogsView = defineAsyncComponent(() => import("./views/LogsView.vue"));
+const SettingsView = defineAsyncComponent(() => import("./views/SettingsView.vue"));
 import { api, clearMasterKey, getMasterKey, setMasterKey } from "./api/client";
 import { locale, setLocale, t } from "./i18n";
 

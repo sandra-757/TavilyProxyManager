@@ -21,7 +21,7 @@ export function clearMasterKey(): void {
   masterKeyRef.value = ''
 }
 
-export const api = axios.create()
+export const api = axios.create({ timeout: 30000 })
 
 api.interceptors.request.use((config) => {
   const token = getMasterKey()
@@ -33,7 +33,19 @@ api.interceptors.request.use((config) => {
 })
 
 api.interceptors.response.use(
-  (response) => response,
+  (response) => {
+    // Behind the Authelia SSO front, an expired SSO session makes API
+    // calls land on the portal login page (HTML) instead of JSON. Detect
+    // that and send the browser back through the login flow instead of
+    // letting views fail silently on HTML payloads.
+    const contentType = String(response.headers?.["content-type"] ?? "")
+    const url = String(response.config?.url ?? "")
+    if (url.startsWith("/api") && contentType.includes("text/html")) {
+      window.location.href = "/"
+      return new Promise(() => {})
+    }
+    return response
+  },
   (error) => {
     if (error?.response?.status === 401) {
       clearMasterKey()
