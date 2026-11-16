@@ -118,3 +118,17 @@ an index.html whose JS/CSS assets 404 and the panel renders blank.
 
 Verify after building by fetching index.html AND every asset it
 references (status + content type), not just the HTML.
+
+## Frontend pass (2026-11-16, same branch)
+
+- Settings page now has a Proxy Token card (view/copy/reset) matching
+  the backend endpoints added in the P0 branch; EN + ZH strings.
+- Views are lazy-loaded and echarts is imported modularly: the initial
+  JS bundle dropped from ~1.9 MB to ~0.57 MB; dashboard/settings/logs/
+  keys chunks load on demand.
+- API client: 30s request timeout; when an /api call returns HTML
+  (Authelia SSO session expired and the request landed on the portal),
+  the browser is sent back through the login flow instead of the view
+  failing silently.
+- Version string bumped to 1.1.4-fork.1 so the settings page no longer
+  claims to be the unmodified upstream release.
