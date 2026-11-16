@@ -105,3 +105,16 @@ Correctness and operability fixes on top of the P0 branch:
 Known remaining limitation: responses are still fully buffered (no
 streaming passthrough for `/research` SSE); the 50 MiB response cap
 from the P0 branch bounds the memory impact.
+
+## Build note (learned the hard way, 2026-11-16)
+
+`server/public/assets/` is gitignored: the frontend bundle must be
+copied into the embed directory before `go build`, or the binary ships
+an index.html whose JS/CSS assets 404 and the panel renders blank.
+
+    cd web && npm ci && npm run build && cd ..
+    cp -r web/dist/* server/public/
+    go build ./server
+
+Verify after building by fetching index.html AND every asset it
+references (status + content type), not just the HTML.
